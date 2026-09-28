@@ -25,25 +25,25 @@ jobs:
 
       - name: Build and push gateway image
         run: |
-          docker build -t ghcr.io/${{ github.actor }}/quickticket-gateway:${{ github.sha }} ./app/gateway
-          docker push ghcr.io/${{ github.actor }}/quickticket-gateway:${{ github.sha }}
+          docker build -t ghcr.io/iamdlite/quickticket-gateway:${{ github.sha }} ./app/gateway
+          docker push ghcr.io/iamdlite/quickticket-gateway:${{ github.sha }}
 
       - name: Build and push events image
         run: |
-          docker build -t ghcr.io/${{ github.actor }}/quickticket-events:${{ github.sha }} ./app/events
-          docker push ghcr.io/${{ github.actor }}/quickticket-events:${{ github.sha }}
+          docker build -t ghcr.io/iamdlite/quickticket-events:${{ github.sha }} ./app/events
+          docker push ghcr.io/iamdlite/quickticket-events:${{ github.sha }}
 
       - name: Build and push payments image
         run: |
-          docker build -t ghcr.io/${{ github.actor }}/quickticket-payments:${{ github.sha }} ./app/payments
-          docker push ghcr.io/${{ github.actor }}/quickticket-payments:${{ github.sha }}
+          docker build -t ghcr.io/iamdlite/quickticket-payments:${{ github.sha }} ./app/payments
+          docker push ghcr.io/iamdlite/quickticket-payments:${{ github.sha }}
 
       - name: Update image tags in manifests
         run: |
           SHA=${{ github.sha }}
-          sed -i "s|image: ghcr.io/.*/quickticket-gateway:.*|image: ghcr.io/${{ github.actor }}/quickticket-gateway:${SHA}|" k8s/gateway.yaml
-          sed -i "s|image: ghcr.io/.*/quickticket-events:.*|image: ghcr.io/${{ github.actor }}/quickticket-events:${SHA}|" k8s/events.yaml
-          sed -i "s|image: ghcr.io/.*/quickticket-payments:.*|image: ghcr.io/${{ github.actor }}/quickticket-payments:${SHA}|" k8s/payments.yaml
+          sed -i "s|image: ghcr.io/.*/quickticket-gateway:.*|image: ghcr.io/iamdlite/quickticket-gateway:${SHA}|" k8s/gateway.yaml
+          sed -i "s|image: ghcr.io/.*/quickticket-events:.*|image: ghcr.io/iamdlite/quickticket-events:${SHA}|" k8s/events.yaml
+          sed -i "s|image: ghcr.io/.*/quickticket-payments:.*|image: ghcr.io/iamdlite/quickticket-payments:${SHA}|" k8s/payments.yaml
 
       - name: Commit and push manifest update
         run: |
