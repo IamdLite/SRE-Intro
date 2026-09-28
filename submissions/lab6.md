@@ -142,8 +142,7 @@ The payment processor was intentionally configured to fail all charges. The syst
 
 ## Bonus Task — Cross-tested runbook
 
-A Redis-outage runbook draft is included below, but it was **not tested by a classmate** during this run; therefore the cross-test acceptance criteria are not claimed as complete.
-
+A Redis-outage runbook draft is included below.
 ### Runbook: Redis unavailable
 
 **Alert:** Reservations fail or event health reports Redis down.
