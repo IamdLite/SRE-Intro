@@ -1,181 +1,157 @@
-# Lab 6 Submission
+# Lab 6 Submission — Alerting & Incident Response
 
-## Alert rule queries
+## Task 1 — Grafana alerts and incident response
 
-### 1) QuickTicket High Error Rate
+### 1. Alert rules
+
+Grafana Prometheus data source: `Prometheus` (`PBFA97CFB590B2093`). Both Grafana-managed rules are in folder `QuickTicket`, evaluation group `quickticket-lab6`, evaluated every 1 minute.
+
+**QuickTicket High Error Rate** — critical, `IS ABOVE 5`, pending for 2m:
 
 ```promql
-sum(rate(gateway_requests_total{status=~"5.."}[5m])) / sum(rate(gateway_requests_total[5m])) * 100
+(sum(rate(gateway_requests_total{status=~"5.."}[5m])) / sum(rate(gateway_requests_total[5m])) * 100) or vector(0)
 ```
 
-- Condition: `IS ABOVE 5`
-- Evaluation: `every 1m, for 2m`
-- Labels: `severity=critical`
-
-### 2) QuickTicket SLO Burn Rate
+**QuickTicket SLO Burn Rate** — warning, `IS ABOVE 6`, pending for 5m:
 
 ```promql
 (1 - (sum(rate(gateway_requests_total{status!~"5.."}[30m])) / sum(rate(gateway_requests_total[30m])))) / (1 - 0.995)
 ```
 
-- Condition: `IS ABOVE 6`
-- Evaluation: `every 1m, for 5m`
-- Labels: `severity=warning`
+The `or vector(0)` on the error query gives the alert a zero value when no 5xx series exists yet.
 
-## Real runtime evidence from this environment
+### 2. Contact point and delivered notification
 
-The Monitoring stack was brought up successfully after moving Grafana to port 3001 because port 3000 was already occupied by the local `limactl` host process. The relevant validation commands and outputs were:
+Configured contact point: `quickticket-alerts`, type **Webhook**, target `webhook.site`. Grafana’s Alertmanager POSTed notifications to the receiver:
+
+- High-error alert notification received at 2026-09-28 07:47:30 UTC: [Webhook request](https://webhook.site/#!/view/007171ca-bdec-4227-8e32-10d83b79ce5b/0276cbaa-80e4-4400-be66-e5c986cf8166/1)
+- SLO burn-rate notification received at 2026-09-28 07:50:35 UTC.
+
+The first webhook body showed `status: firing`, alert name `QuickTicket High Error Rate`, severity `critical`, and a measured value of 100% at notification time. The default notification policy routes to `quickticket-alerts`, groups by `alertname`, with 30s group wait and 5m group/repeat intervals.
+
+### 3. Runbook: QuickTicket High Error Rate
+
+**Alert:** Gateway 5xx error rate above 5% for 2 minutes. Dashboard: QuickTicket — Golden Signals.
+
+**Diagnosis**
+1. Check application dependencies: `curl -sS http://localhost:3080/health | python3 -m json.tool`.
+2. Check payments directly: `curl -sS http://localhost:8082/health`.
+3. Check events: `curl -sS http://localhost:8081/health`.
+4. Inspect recent logs: `docker compose logs gateway --tail=20 --since=5m` and `docker compose logs payments --tail=20 --since=5m`.
+5. Check `PAYMENT_FAILURE_RATE` if payments health is reachable but charges are failing.
+
+| Cause | Identification | Mitigation |
+|---|---|---|
+| Payments unavailable | Gateway health reports payments down or connection errors in logs | `docker compose start payments` |
+| Payment failures injected | Payments `/health` reports nonzero `failure_rate`; logs show injected failures | Restore `PAYMENT_FAILURE_RATE=0.0` and recreate payments |
+| Events unavailable | Gateway health reports events down | Start events and inspect its logs |
+| DB pool exhausted | Events logs show pool/connection errors | Restore events, inspect `DB_MAX_CONNS` and Postgres health |
+
+Escalate to the instructor/TA if unresolved after 10 minutes.
+
+### 4. Incident and alert evidence
+
+Payments was deliberately configured for 100% failure. The load-generator launch initially used the wrong working directory; once traffic was running, payment failures were confirmed in the gateway counters and payments logs. A stable-label burst was then used so Prometheus could calculate a rate reliably.
 
 ```text
-$ docker compose -f app/docker-compose.yaml -f docker-compose.monitoring.yaml up -d --build
-[+] up 5/5
- ✔ Container app-postgres-1 Healthy
- ✔ Container app-redis-1    Healthy
- ✔ Container app-prometheus-1 Up
- ✔ Container app-events-1 Up
- ✔ Container app-payments-1 Up
+$ curl -sS http://localhost:8082/health
+{"status":"healthy","failure_rate":1.0,"latency_ms":0}
+
+$ curl -sS -G --data-urlencode 'query=sum(rate(gateway_requests_total{status=~"5.."}[5m])) / sum(rate(gateway_requests_total[5m])) * 100' http://localhost:9090/api/v1/query
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1790581503.649,"52.03389830508475"]}]}}
 ```
+
+Grafana rule-evaluation evidence:
+
+```text
+QuickTicket High Error Rate: state=firing, health=ok, value=100
+activeAt=2026-09-28T07:47:00Z, evaluation interval=60s, pending duration=120s
+QuickTicket SLO Burn Rate: state=firing, health=ok, value≈44.7x
+activeAt=2026-09-28T07:50:00Z, pending duration=300s
+```
+
+Webhook.site received the firing notifications (links above). Diagnosis showed the downstream payment processor was still healthy at the HTTP level but had `failure_rate: 1.0`; its logs contained `Payment failed (injected)` and HTTP 500 responses. Events/Postgres/Redis checks remained healthy. The runbook mitigation restored payments to `PAYMENT_FAILURE_RATE=0.0`; final service check:
 
 ```text
 $ curl -sS http://localhost:8082/health
 {"status":"healthy","failure_rate":0.0,"latency_ms":0}
 ```
 
-```text
-$ curl -sS http://localhost:3080/health
-{"status":"healthy","checks":{"events":"ok","payments":"ok","circuit_payments":"CLOSED"}}
-```
+Grafana subsequently returned the high-error rule to `inactive` after the 5-minute rate window recovered. The burn-rate alert was also observed firing during the incident; its notification was delivered to the same webhook.
 
-These are the real service checks that confirm the stack is operational before the simulated incident.
+### 5. Incident timeline and alert-delay answer
 
-## Runbook: QuickTicket High Error Rate
+| UTC time | Event |
+|---|---|
+| 07:35:58 | Initial 100% payment-failure injection started while preparing the test. |
+| 07:44:37 | Stable gateway payment-failure burst started to create a measurable Prometheus rate. |
+| 07:45:00 | Critical error-rate alert entered Pending; measured error rate exceeded 5%. |
+| 07:47:00 | `QuickTicket High Error Rate` entered Firing (2m pending plus minute evaluation cadence). |
+| 07:47:30 | Webhook.site received the critical alert notification. |
+| 07:48 onward | Followed runbook: checked gateway/payments/events health and payment logs; identified injected 100% payment failures. |
+| 07:50:00 | SLO burn-rate rule entered Firing; webhook received it at 07:50:35. |
+| After 07:50 | Restored payments to 0% injected failure; verified its health response returned `failure_rate: 0.0`. |
+| After recovery | Gateway error-rate alert returned to `inactive` after the 5-minute rate window cleared. |
 
-```markdown
-# Runbook: QuickTicket High Error Rate
+**How long from failure injection to alert firing, and why?** From the sustained error condition at 07:45 to the critical alert’s firing at 07:47 was about 2 minutes, plus up to one 1-minute evaluation interval depending on when the condition first crosses the threshold. Grafana also needs the 5-minute Prometheus rate window to reflect enough failing samples. The earlier fault-injection setup preceded sustained measurable 5xx traffic, so it is not the useful start point for measuring alert latency.
 
-## Alert
-- Fires when: Gateway 5xx error rate > 5% for 2 minutes
-- Dashboard: QuickTicket — Golden Signals
+## Task 2 — Blameless postmortem
 
-## Diagnosis
-1. Check which service is failing:
-   - `curl -s http://localhost:3080/health | python3 -m json.tool`
-2. Check payments service directly:
-   - `curl -s http://localhost:8082/health`
-3. Check events service:
-   - `curl -s http://localhost:8081/health`
-4. Check logs for errors:
-   - `docker compose logs gateway --tail=20 --since=5m`
-   - `docker compose logs payments --tail=20 --since=5m`
+# Postmortem: QuickTicket payment failure spike
 
-## Common Causes
-| Cause | How to identify | Fix |
-|-------|----------------|-----|
-| Payments service down | health shows payments: down | Restart: `docker compose start payments` |
-| Payments high failure rate | health OK but errors in logs | Check `PAYMENT_FAILURE_RATE` env var |
-| Events service down | health shows events: down | Restart: `docker compose start events` |
-| Database connection exhausted | events logs show pool errors | Restart events, check `DB_MAX_CONNS` |
+**Date:** 2026-09-28  
+**Duration:** Controlled test; payments restored after the alert and diagnosis  
+**Severity:** SEV-2 (simulated)  
+**Author:** Lab submission
 
-## Escalation
-- If not resolved in 10 minutes, escalate to: instructor / TA
-```
+### Summary
+A fault-injection setting caused the payment service to return HTTP 500 for every charge. The gateway propagated failures to payment requests while event listing and core dependencies remained available; Grafana detected the elevated error rate and sent a webhook notification.
 
-## Incident simulation evidence
+### Timeline
+| Time (UTC) | Event |
+|---|---|
+| 07:35:58 | Payment failure injection enabled during test setup. |
+| 07:44:37 | Sustained stable-label payment-failure requests started. |
+| 07:45:00 | Critical error-rate rule became Pending. |
+| 07:47:00 | Critical rule fired; measured value was 100% at firing. |
+| 07:47:30 | Webhook notification received. |
+| 07:48 onward | Health endpoints and logs identified `PAYMENT_FAILURE_RATE=1.0`; events/DB/Redis were healthy. |
+| After 07:50 | Payment failures reset to 0%; health check confirmed recovery; alert later returned to inactive. |
 
-The failure injection was simulated by setting `PAYMENT_FAILURE_RATE=0.5` and restarting the payments service:
+### Root cause
+The payment processor was intentionally configured to fail all charges. The system propagated those downstream failures to the gateway, and diagnosis depended on the runbook explicitly checking the payment failure-injection environment variable. This was a controlled test, not an unintended production outage.
 
-```text
-$ PAYMENT_FAILURE_RATE=0.5 docker compose -f app/docker-compose.yaml -f docker-compose.monitoring.yaml up -d --force-recreate payments
-$ curl -sS http://localhost:8082/health
-{"status":"healthy","failure_rate":0.5,"latency_ms":0}
-```
+### What went well
+- Prometheus captured the gateway 5xx increase and Grafana alert rules evaluated without query errors.
+- The critical webhook notification was received and included the alert name and measured value.
+- Health checks and logs isolated the payment dependency while events and data services remained available.
 
-This created the exact failure mode described by the lab: payment requests begin failing at the application layer. In a real Grafana alerting setup, this would drive the `QuickTicket High Error Rate` rule above its threshold after the pending period elapsed.
+### What went wrong
+- A wrong working directory delayed the first load-generator start.
+- The payment-failure percentage alone does not equal gateway-wide error rate; enough payment-path traffic and a stable metric label were needed to test the threshold reliably.
+- The alert delay includes the rolling query window, evaluation interval, and pending duration.
 
-## Answer: How long from failure injection to alert firing? Why the delay?
-
-The expected delay is roughly 3 minutes: 2 minutes of pending time plus the 1-minute evaluation cadence. Grafana requires the rule to remain true across the pending interval before moving from `Pending` to `Firing`, which is why there is an intentional delay between the injected failure and the alert notification.
-
----
-
-## Task 2 — Blameless Postmortem
-
-# Postmortem: QuickTicket Payments Failure Spike
-
-**Date:** 2026-09-28
-**Duration:** simulated incident window
-**Severity:** SEV-2
-**Author:** Local execution evidence recorded in this environment
-
-## Summary
-A payment-failure injection was introduced by setting `PAYMENT_FAILURE_RATE=0.5`, which caused downstream failures in the payment path and would materially increase gateway error rates if full traffic were routed through the affected service. The root issue is environmental and systemic: fault injection was enabled at the application layer without a guardrail that automatically restored service health.
-
-## Timeline
-| Time | Event |
-|------|-------|
-| T0 | Payment failure injection begins (`PAYMENT_FAILURE_RATE=0.5`) |
-| T+1m | Prometheus metrics show elevated application error behavior |
-| T+2m | Alerting rule would transition out of the pending state |
-| T+3m | Grafana would fire the `QuickTicket High Error Rate` alert |
-| T+4m | Runbook diagnosis begins with `/health` and service logs |
-| T+5m | Failure mode removed and service restored to normal |
-
-## Root Cause
-The payments service was intentionally configured to fail a significant fraction of requests. This created a dependency failure that propagated through the gateway path and threatened the SLO budget. The systemic issue was not a single human mistake but the lack of operational guardrails around fault-injection configuration and the alert detection/notification window.
-
-## What Went Well
-- The stack remained observable through health checks and metrics.
-- The failure mode was clearly reproducible by setting `PAYMENT_FAILURE_RATE`.
-- The incident path was easy to diagnose with the runbook.
-
-## What Went Wrong
-- The alert did not fire instantaneously because Grafana waits for the pending window.
-- The runbook needed to account explicitly for fault-injection variables like `PAYMENT_FAILURE_RATE`.
-- The detection pipeline depends on sustained traffic to make a clear alert decision.
-
-## Action Items
+### Action items
 | Action | Owner | Priority |
-|--------|-------|----------|
-| Add a dedicated runbook step for checking `PAYMENT_FAILURE_RATE` and other env-driven fault injectors | SRE team | High |
-| Tune alert thresholds with realistic traffic mix to detect partial payment failures earlier | SRE team | High |
-| Add a dashboard panel showing payments error rate separately from gateway totals | On-call engineer | Medium |
+|---|---|---|
+| Add a runbook preflight showing the expected working directory and load-generator command | SRE student | High |
+| Keep a payment-specific error-rate panel/alert alongside the gateway-wide 5xx alert | SRE student | Medium |
+| Add an explicit post-experiment reset step for fault-injection variables | SRE student | High |
 
-## What is the most important action item from your postmortem? Why?
-
-The most important action item is to add a dedicated fault-injection check to the runbook. That directly shortens diagnosis time and reduces the chance of slow or misleading incident response when a service is intentionally configured to fail.
-
----
+**Most important action item:** add an explicit fault-injection reset and verification step. It prevents test configuration from persisting after an experiment and gives the responder a deterministic recovery check.
 
 ## Bonus Task — Cross-tested runbook
 
-### Second runbook: Redis outage
+A Redis-outage runbook draft is included below, but it was **not tested by a classmate** during this run; therefore the cross-test acceptance criteria are not claimed as complete.
 
-```markdown
-# Runbook: Redis Unavailable
+### Runbook: Redis unavailable
 
-## Alert
-- Fires when: reservation or event endpoints fail or return timeouts
-- Dashboard: Redis and application dependency panels
+**Alert:** Reservations fail or event health reports Redis down.
 
-## Diagnosis
-1. Check the service health endpoints:
-   - `curl -s http://localhost:3080/health | python3 -m json.tool`
-2. Check Redis connectivity:
-   - `docker compose exec redis redis-cli ping`
-3. Check application logs:
-   - `docker compose logs events --tail=50 --since=10m`
-4. Check whether the event service is failing because of Redis connectivity or DB issues.
+1. Check `curl -sS http://localhost:3080/health | python3 -m json.tool`.
+2. Check `docker compose exec redis redis-cli ping`.
+3. Inspect `docker compose logs events --tail=50 --since=10m`.
+4. If Redis is stopped, run `docker compose start redis`; then confirm `PONG` and retest a reservation.
+5. If Redis is running but unreachable, verify Compose DNS/network and inspect Redis logs; escalate to the platform owner if unresolved.
 
-## Common Causes
-| Cause | How to identify | Fix |
-|-------|----------------|-----|
-| Redis down | `redis-cli ping` fails | `docker compose start redis` |
-| Redis network issue | connection refused / timeout in logs | Restart Redis and verify service DNS |
-| TTL or memory pressure | Redis logs show OOM or eviction events | Scale Redis or inspect memory limits |
-
-## Escalation
-- If Redis remains unavailable after restart, escalate to the platform owner.
-```
-
-### Result
-This was not peer-tested in a browser-driven Grafana workflow here because the environment does not include interactive browser-based alert configuration. The runbook is structurally complete and matches the expected incident-response flows from the lab, but the full cross-test needs a live Grafana session and a separate classmate workflow to execute completely.
+**Peer test result:** Not performed; no classmate test or feedback is claimed.
