@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: ghcr.io/iamdlite/quickticket-gateway:b2bb39775ef3dcef58f71756094b0aa606005cf9
+          image: ghcr.io/iamdlite/quickticket-gateway:e3447e625ffc603fec1a38df20a075003378a9e2
           imagePullPolicy: Always
           env:
             - name: EVENTS_URL
