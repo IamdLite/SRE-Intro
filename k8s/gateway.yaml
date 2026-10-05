@@ -32,8 +32,8 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: ghcr.io/iamdlite/quickticket-gateway:e3447e625ffc603fec1a38df20a075003378a9e2
-          imagePullPolicy: Always
+          image: quickticket-gateway:lab8-fix
+          imagePullPolicy: IfNotPresent
           env:
             - name: EVENTS_URL
               value: "http://events:8081"
