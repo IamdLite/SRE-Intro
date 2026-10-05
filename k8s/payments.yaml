@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: payments
-          image: ghcr.io/iamdlite/quickticket-payments:5beba90d074db93a031cf818f6337f0c34eaa488
+          image: ghcr.io/iamdlite/quickticket-payments:3a60a4f96dff903773a3ce3fa3b6b09b5861a850
           imagePullPolicy: Always
           env:
             - name: PAYMENT_FAILURE_RATE
