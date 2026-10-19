@@ -24,7 +24,7 @@ from collections import defaultdict, deque
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 # --- Config ---
 EVENTS_URL = os.getenv("EVENTS_URL", "http://events:8081")
@@ -44,6 +44,10 @@ CB_COOLDOWN_S = float(os.getenv("CB_COOLDOWN_S", "30"))
 
 # Rate limiter (Lab 11) — per endpoint, sliding window
 RATE_LIMIT_RPS = int(os.getenv("RATE_LIMIT_RPS", "10"))
+
+# Bulkhead (Lab 11 bonus) — bound concurrent payments calls
+BULKHEAD_PAYMENTS_MAX = int(os.getenv("BULKHEAD_PAYMENTS_MAX", "10"))
+BULKHEAD_PAYMENTS_TIMEOUT_S = float(os.getenv("BULKHEAD_PAYMENTS_TIMEOUT_S", "0.5"))
 
 # --- Logging ---
 logging.basicConfig(
@@ -68,6 +72,12 @@ CB_STATE_TRANSITIONS = Counter(
 )
 RATE_LIMIT_REJECTIONS = Counter(
     "gateway_rate_limit_rejections_total", "Requests rejected by rate limiter", ["path"]
+)
+GATEWAY_BULKHEAD_IN_FLIGHT = Gauge(
+    "gateway_bulkhead_in_flight", "Current in-flight bulkhead occupancy", ["target"]
+)
+GATEWAY_BULKHEAD_REJECTIONS = Counter(
+    "gateway_bulkhead_rejections_total", "Bulkhead rejections", ["target"]
 )
 
 client = httpx.AsyncClient(timeout=GATEWAY_TIMEOUT_MS / 1000)
@@ -95,15 +105,26 @@ async def call_with_retry(func, target: str, max_retries: int = RETRY_MAX):
     """Call `func` with retry-on-transient-error."""
     for attempt in range(max_retries + 1):
         try:
-            return await func()
+            result = await func()
+            if attempt > 0:
+                RETRY_TOTAL.labels(target, "succeeded_after_retry").inc()
+            return result
         except Exception as exc:
-            if attempt >= max_retries:
-                RETRY_TOTAL.labels(target, "failed").inc()
+            retryable = isinstance(exc, (httpx.TimeoutException, httpx.ConnectError))
+            if isinstance(exc, httpx.HTTPStatusError):
+                status = exc.response.status_code if exc.response is not None else 0
+                retryable = status >= 500 or status in (408, 429)
+            if not retryable:
+                RETRY_TOTAL.labels(target, "non_retryable").inc()
                 raise
-            RETRY_TOTAL.labels(target, "retry").inc()
-            delay_s = (RETRY_BASE_DELAY_MS / 1000.0) * (2 ** attempt)
-            jitter_s = random.uniform(0.05, 0.25)
-            await asyncio.sleep(delay_s + jitter_s)
+            if attempt >= max_retries:
+                RETRY_TOTAL.labels(target, "exhausted").inc()
+                raise
+            RETRY_TOTAL.labels(target, "retried").inc()
+            delay_s = (RETRY_BASE_DELAY_MS / 1000.0) * (2 ** attempt) + random.uniform(
+                0, RETRY_BASE_DELAY_MS / 1000.0
+            )
+            await asyncio.sleep(delay_s)
     raise RuntimeError(f"retry loop exhausted for {target}")
 
 
@@ -183,16 +204,46 @@ class RateLimiter:
         self.hits: dict[str, deque] = defaultdict(deque)
 
     def allow(self, key: str) -> bool:
-        """Return True if the request should be allowed.
-
-        No-op default: always True. Lab 11 task 11.8 replaces this body.
-        """
-        # TODO (Lab 11): implement sliding-window check here.
+        """Return True if the request should be allowed."""
+        now = time.time()
+        q = self.hits[key]
+        cutoff = now - self.window_s
+        while q and q[0] < cutoff:
+            q.popleft()
+        if len(q) >= self.rps:
+            return False
+        q.append(now)
         return True
+
+
+class BulkheadFullError(Exception):
+    """Raised when a target bulkhead is saturated."""
+
+
+class Bulkhead:
+    def __init__(self, name: str, max_concurrent: int, acquire_timeout_s: float):
+        self.name = name
+        self.max_concurrent = max_concurrent
+        self.acquire_timeout_s = acquire_timeout_s
+        self.sem = asyncio.Semaphore(max_concurrent)
+
+    async def call(self, func):
+        try:
+            await asyncio.wait_for(self.sem.acquire(), timeout=self.acquire_timeout_s)
+        except asyncio.TimeoutError:
+            GATEWAY_BULKHEAD_REJECTIONS.labels(self.name).inc()
+            raise BulkheadFullError(f"bulkhead[{self.name}] is full")
+        try:
+            GATEWAY_BULKHEAD_IN_FLIGHT.labels(self.name).inc()
+            return await func()
+        finally:
+            self.sem.release()
+            GATEWAY_BULKHEAD_IN_FLIGHT.labels(self.name).dec()
 
 
 payments_cb = CircuitBreaker(CB_FAILURE_THRESHOLD, CB_COOLDOWN_S, name="payments")
 rate_limiter = RateLimiter(RATE_LIMIT_RPS)
+payments_bulkhead = Bulkhead("payments", BULKHEAD_PAYMENTS_MAX, BULKHEAD_PAYMENTS_TIMEOUT_S)
 
 
 # --- Middleware ---
@@ -348,8 +399,13 @@ async def pay_reservation(reservation_id: str):
         return resp
 
     try:
-        pay_resp = await payments_cb.call(lambda: call_with_retry(_charge, target="payments"))
+        pay_resp = await payments_bulkhead.call(
+            lambda: payments_cb.call(lambda: call_with_retry(_charge, target="payments"))
+        )
         payment_ref = pay_resp.json().get("payment_ref", "unknown")
+    except BulkheadFullError:
+        log.error("bulkhead full, skipping payments call")
+        raise HTTPException(503, "Payment service temporarily unavailable (bulkhead full)")
     except CircuitOpenError:
         log.error("circuit open, skipping payments call")
         raise HTTPException(503, "Payment service temporarily unavailable (circuit open)")

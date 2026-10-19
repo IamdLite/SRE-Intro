@@ -30,15 +30,24 @@ spec:
       labels:
         app: gateway
     spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: gateway
       containers:
         - name: gateway
-          image: quickticket-gateway:lab8-fix
-          imagePullPolicy: IfNotPresent
+          image: quickticket-gateway:v1
+          imagePullPolicy: Never
           env:
             - name: EVENTS_URL
               value: "http://events:8081"
             - name: PAYMENTS_URL
               value: "http://payments:8082"
+            - name: NOTIFICATIONS_URL
+              value: "http://notifications:8083"
             - name: GATEWAY_TIMEOUT_MS
               value: "5000"
             - name: APP_VERSION
